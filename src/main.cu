@@ -140,6 +140,21 @@ int main() {
               << "× faster vs CPU, "
               << (ms_soft_naive / ms_soft_tiled)
               << "× vs naive)\n";
+    
+    // warp GPU
+    cudaEventRecord(start);
+    softmax_warp<<<M, 32>>>(C_d, M, N);
+    cudaDeviceSynchronize();
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms_soft_warp;
+    cudaEventElapsedTime(&ms_soft_warp, start, stop);
+    std::cout << "Warp softmax:  " << ms_soft_warp/1000.0 << " s  ("
+              << cpu_soft_t.count() / (ms_soft_warp/1000.0)
+              << "× faster vs CPU, "
+              << (ms_soft_naive / ms_soft_warp)
+              << "× vs naive)\n";
+
 
     cudaFree(A_d); cudaFree(B_d); cudaFree(C_d);
     return 0;
