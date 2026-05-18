@@ -6,6 +6,7 @@
 
 #include "../include/gemm_kernels.h"
 #include "../include/softmax_kernels.h"
+#include "../include/attention_kernels.h"
 
 // ---------------- CPU Benchmarks ----------------
 void cpu_gemm(const float* A, const float* B, float* C,
@@ -154,9 +155,75 @@ int main() {
               << "× faster vs CPU, "
               << (ms_soft_naive / ms_soft_warp)
               << "× vs naive)\n";
-
-
+    
     cudaFree(A_d); cudaFree(B_d); cudaFree(C_d);
+
+    // FlashAttention
+    int N_attn = 4096, d = 32;
+    std::vector<float> Qq(N_attn*d), Kk(N_attn*d), Vv(N_attn*d);
+    std::vector<float> O_cpu(N_attn*d), O_gpu(N_attn*d), S_buf(N_attn*N_attn);
+
+    for (auto& x : Qq)  x = static_cast<float>(rand()) / RAND_MAX;
+    for (auto& x : Kk)  x = static_cast<float>(rand()) / RAND_MAX;
+    for (auto& x : Vv)  x = static_cast<float>(rand()) / RAND_MAX;
+
+    // CPU reference
+    auto t0 = std::chrono::high_resolution_clock::now();
+    naive_attention_cpu(Qq.data(), Kk.data(), Vv.data(),
+                        O_cpu.data(), S_buf.data(), N_attn, d);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> cpu_attn_t = t1 - t0;
+
+    // GPU allocations
+    float *Q_d, *K_d, *V_d, *O_d, *S_d;
+    cudaMalloc(&Q_d, N_attn*d*sizeof(float));
+    cudaMalloc(&K_d, N_attn*d*sizeof(float));
+    cudaMalloc(&V_d, N_attn*d*sizeof(float));
+    cudaMalloc(&O_d, N_attn*d*sizeof(float));
+    cudaMalloc(&S_d, N_attn*N_attn*sizeof(float)); // only used by naive GPU
+
+    cudaMemcpy(Q_d, Qq.data(), N_attn*d*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(K_d, Kk.data(), N_attn*d*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(V_d, Vv.data(), N_attn*d*sizeof(float), cudaMemcpyHostToDevice);
+
+    std::cout << "\n===== Attention =====\n";
+    std::cout << "CPU naive attention: " << cpu_attn_t.count() << " s\n";
+
+    // naive GPU attention
+    dim3 attn_block(16, 16);
+    dim3 attn_grid((N_attn+15)/16, (N_attn+15)/16);
+
+    cudaEventRecord(start);
+    gemm_naive<<<attn_grid, attn_block>>>(Q_d, K_d, S_d, N_attn, d, N_attn);
+    softmax_warp<<<N_attn, 32>>>(S_d, N_attn, N_attn);
+    gemm_naive<<<attn_grid, attn_block>>>(S_d, V_d, O_d, N_attn, N_attn, d);
+    cudaDeviceSynchronize();
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms_naive_attn;
+    cudaEventElapsedTime(&ms_naive_attn, start, stop);
+    std::cout << "Naive GPU attention: " << ms_naive_attn/1000.0 << " s\n";
+
+    // FA Fwd 
+    int rows_per_block = 8;
+    dim3 fa_block(32, rows_per_block);
+    dim3 fa_grid((N_attn + rows_per_block - 1) / rows_per_block);
+
+    cudaEventRecord(start);
+    flash_attention_fwd<<<fa_grid, fa_block>>>(Q_d, K_d, V_d, O_d, N_attn, d);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms_fa;
+    cudaEventElapsedTime(&ms_fa, start, stop);
+    cudaMemcpy(O_gpu.data(), O_d, N_attn*d*sizeof(float), cudaMemcpyDeviceToHost);
+
+    std::cout << "FlashAttention fwd:  " << ms_fa/1000.0 << " s  ("
+              << cpu_attn_t.count()/(ms_fa/1000.0) << "x faster vs CPU, "
+              << ms_naive_attn/ms_fa << "x faster vs naive GPU)\n";
+    std::cout << "FA Max abs error: "
+              << max_abs_error(O_cpu.data(), O_gpu.data(), N_attn*d) << "\n";
+
+    cudaFree(Q_d); cudaFree(K_d); cudaFree(V_d); cudaFree(O_d); cudaFree(S_d);
     return 0;
 }
 
